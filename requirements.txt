@@ -1,0 +1,8 @@
+python-telegram-bot==20.6
+requests
+schedule
+pandas
+pytz
+yfinance
+
+python-telegram-bot[ext]==20.6
