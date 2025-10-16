@@ -7,9 +7,11 @@ import pytz
 import yfinance as yf
 from datetime import datetime
 from telegram import Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
+import threading
 
 # ===============================
-# CONFIG
+# CONFIGURATION
 # ===============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
@@ -18,15 +20,12 @@ TIMEZONE = pytz.timezone("Asia/Dhaka")
 PAIR_LIST = ["EUR/USD", "GBP/USD"]   # locked
 LEVERAGE = 100
 
-# Money management
 START_CAPITAL = float(os.getenv("START_CAPITAL", 1000))
-RISK_PERCENT  = float(os.getenv("RISK_PERCENT", 2))
-RR            = float(os.getenv("RR", 2))
+capital = START_CAPITAL
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", 2))
+RR = float(os.getenv("RR", 2))
 
-# Demo result toggle
 DEMO_RESULT = os.getenv("DEMO_RESULT", "0") == "1"
-
-# Optional TwelveData (if you add a key, it will try first)
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_KEY", "").strip()
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -41,8 +40,8 @@ def dhaka_str():
     return now_dhaka().strftime("%Y-%m-%d %H:%M")
 
 def is_weekend_off():
-    wd = now_dhaka().weekday()  # Monday=0 ... Sunday=6
-    return wd in (4, 5, 6)      # Friday, Saturday, Sunday off
+    wd = now_dhaka().weekday()  # Monday=0 … Sunday=6
+    return wd in (4, 5, 6)      # Friday, Saturday, Sunday
 
 def send(text: str):
     try:
@@ -51,7 +50,6 @@ def send(text: str):
         print("Telegram send error:", e)
 
 def symbol_to_yahoo(pair: str) -> str:
-    # Map "EUR/USD" -> "EURUSD=X"
     return pair.replace("/", "") + "=X"
 
 def id_for(pair: str) -> str:
@@ -83,11 +81,10 @@ def fetch_from_twelvedata(pair: str):
 def fetch_from_yahoo(pair: str):
     try:
         ticker = symbol_to_yahoo(pair)
-        # last ~2 days hourly candles
         data = yf.Ticker(ticker).history(period="2d", interval="60m")
         if data is None or data.empty:
             return None
-        data = data.sort_index(ascending=False)  # latest first
+        data = data.sort_index(ascending=False)
         df = pd.DataFrame({
             "datetime": [idx.strftime("%Y-%m-%d %H:%M:%S") for idx in data.index],
             "open": data["Open"].astype(float).values,
@@ -101,48 +98,41 @@ def fetch_from_yahoo(pair: str):
         return None
 
 def get_candle(pair: str):
-    # Try TwelveData first (if key provided), else Yahoo
     df = fetch_from_twelvedata(pair)
     if df is None:
         df = fetch_from_yahoo(pair)
     return df
 
 # ===============================
-# STRATEGY & SIGNALS
+# STRATEGY & SIGNAL
 # ===============================
-capital = START_CAPITAL
-
 def analyze_pair(df: pd.DataFrame):
-    # Need enough candles
     if df is None or df.empty or len(df) < 60:
         return None
 
     df["EMA20"] = df["close"].ewm(span=20).mean()
     df["EMA50"] = df["close"].ewm(span=50).mean()
-    row = df.iloc[0]  # latest (because we reversed to latest-first)
+    row = df.iloc[0]
 
     direction = "BUY" if row["EMA20"] > row["EMA50"] else "SELL"
 
-    # simple range as ATR-ish
     rng = max(0.0008, abs(float(df["high"].iloc[0]) - float(df["low"].iloc[0])))
     entry = float(row["close"])
     if direction == "BUY":
         sl = entry - rng
         tp = entry + rng * RR
-        rr_text = f"{int(RR)}:1"
     else:
         sl = entry + rng
         tp = entry - rng * RR
-        rr_text = f"{int(RR)}:1"
 
-    return direction, entry, sl, tp, rng, rr_text
+    return direction, entry, sl, tp, rng
 
 def signal_scan():
     if is_weekend_off():
         return
 
     global capital
-    risk   = round(capital * (RISK_PERCENT/100.0), 2)
+    risk = round(capital * (RISK_PERCENT/100.0), 2)
     reward = round(risk * RR, 2)
 
     for pair in PAIR_LIST:
@@ -152,13 +142,13 @@ def signal_scan():
         res = analyze_pair(df)
         if not res:
             continue
-        direction, entry, sl, tp, rng, rr_text = res
+        direction, entry, sl, tp, rng = res
 
         msg = (
 f"📡 [JIBRAIL SIGNAL] {pair} 1h  \n"
 f"{'🚀 BUY | Bullish trend confirmed' if direction=='BUY' else '📉 SELL | Bearish trend confirmed'}  \n"
 f"💹 Entry: {entry:.5f}  \n"
-f"🛑 SL: {sl:.5f} | 🎯 TP: {tp:.5f} (RR {rr_text})  \n"
+f"🛑 SL: {sl:.5f} | 🎯 TP: {tp:.5f} (RR {int(RR)}:1)  \n"
 f"⚙️ Indicators: EMA/RSI aligned | ATR≈{rng:.4f}  \n"
 f"🕒 {dhaka_str()} (Asia/Dhaka)  \n"
 f"⚡ Confidence: 83%  \n"
@@ -170,8 +160,8 @@ f"💬 Use `/take {pair.replace('/','')}|1h|{now_dhaka().strftime('%m%d%H%M')}` 
         send(msg)
 
         if DEMO_RESULT:
-            # simulate immediate outcome for showcase
-            import random; win = random.random() > 0.35
+            import random
+            win = random.random() > 0.35
             send_result(pair, win, entry, sl, tp, risk, reward)
 
 def send_result(pair, win, entry, sl, tp, risk, reward):
@@ -239,15 +229,15 @@ def monthly_auto_reset():
 "🔁 Monthly Auto-Reset Complete!  \n"
 f"📅 New Month: {now_dhaka().strftime('%B %Y')}  \n"
 "📊 Previous Stats:\n"
-"Wins: 18 | Losses: 4 | Profit: +$1,280 | Accuracy: 82%\n"
+"Wins: 18 | Losses: 4 | Profit: +$1,280 | Accuracy: 82%  \n"
 "💵 New Starting Capital: $1000  \n"
 "⚙️ Mode: Fixed Risk + Real Balance Tracking  \n"
 "🧭 Fresh cycle ready, Captain! 💹"
     )
 
-
-from telegram.ext import Application, CommandHandler, ContextTypes
-
+# ===============================
+# Telegram / status command
+# ===============================
 async def status(update, context: ContextTypes.DEFAULT_TYPE):
     global capital
     msg = (
@@ -261,7 +251,6 @@ f"🧭 System: Stable and Ready 💹"
     )
     await update.message.reply_text(msg)
 
-# Initialize Telegram command listener
 def start_command_listener():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("status", status))
@@ -271,25 +260,19 @@ def start_command_listener():
 # SCHEDULERS & MAIN LOOP
 # ===============================
 def setup_schedules():
-    schedule.every().day.at("10:00").do(morning_activation)  # morning msg
-    schedule.every(40).minutes.do(heartbeat)                 # heartbeat
-    schedule.every().hour.at(":00").do(signal_scan)          # hourly scan
-    schedule.every().day.at("10:10").do(monthly_auto_reset)  # monthly reset check
-
+    schedule.every().day.at("10:00").do(morning_activation)
+    schedule.every(40).minutes.do(heartbeat)
+    schedule.every().hour.at(":00").do(signal_scan)
+    schedule.every().day.at("10:10").do(monthly_auto_reset)
 
 def main():
-    import threading
     threading.Thread(target=start_command_listener, daemon=True).start()
     setup_schedules()
     send(
-"🚀 [JIBRAIL DEPLOYMENT STATUS]
-"
-"✅ Successfully Deployed and Running Smoothly 💹  
-"
-f"🕒 {dhaka_str()} (Asia/Dhaka)
-"
-"🧠 System Scan: Ready | Candle Feed: Active
-"
+"🚀 [JIBRAIL DEPLOYMENT STATUS]\n"
+"✅ Successfully Deployed and Running Smoothly 💹\n"
+f"🕒 {dhaka_str()} (Asia/Dhaka)\n"
+"🧠 System Scan: Ready | Candle Feed: Active\n"
 "📡 Markets: EUR/USD, GBP/USD"
     )
     send("🌅 JIBRAIL v6.2 (Manual Status Command Edition) started | Monitoring EURUSD & GBPUSD 💹")
@@ -297,6 +280,5 @@ f"🕒 {dhaka_str()} (Asia/Dhaka)
         schedule.run_pending()
         time.sleep(5)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
